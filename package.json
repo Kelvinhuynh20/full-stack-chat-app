@@ -1,0 +1,27 @@
+{
+  "name": "full-stack-chat-app",
+  "version": "1.0.0",
+  "description": "Real-time chat application with React, Firebase, and Appwrite",
+  "main": "index.js",
+  "scripts": {
+    "client": "cd client && npm run dev",
+    "server": "cd server && npm run dev",
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "install:all": "npm install && cd client && npm install && cd ../server && npm install",
+    "install:types": "cd client && npm install --save-dev @types/react @types/react-dom && cd ../server && npm install --save-dev @types/express firebase-admin",
+    "build": "cd client && npm run build && cd ../server && npm run build",
+    "start": "cd server && npm start"
+  },
+  "keywords": [
+    "chat",
+    "react",
+    "firebase",
+    "appwrite",
+    "typescript"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

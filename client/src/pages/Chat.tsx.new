@@ -1,0 +1,737 @@
+import { useState, useEffect, useRef } from 'react';
+import { useParams } from 'react-router-dom';
+import { useAuth } from '../hooks/useAuth';
+import { db } from '../services/firebase';
+import { 
+  collection, 
+  doc, 
+  getDoc, 
+  query, 
+  orderBy, 
+  onSnapshot,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  serverTimestamp,
+  where
+} from 'firebase/firestore';
+import { format, formatDistanceToNow } from 'date-fns';
+import { uploadFile } from '../services/appwrite';
+import { ChatMessage, FileUpload, TypingIndicator as TypingIndicatorType } from '../../../shared/models/types';
+import { FiSend, FiPaperclip, FiCheck, FiX, FiMessageCircle, FiUsers, FiHash, FiPlusCircle, FiEdit, FiTrash2, FiStar, FiLoader } from 'react-icons/fi';
+
+const Chat = () => {
+  const { chatId } = useParams();
+  const { currentUser } = useAuth();
+  const [chat, setChat] = useState<any>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messageText, setMessageText] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [fileUploads, setFileUploads] = useState<FileUpload[]>([]);
+  const [isTyping, setIsTyping] = useState(false);
+  const [typingUsers, setTypingUsers] = useState<TypingIndicatorType[]>([]);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingText, setEditingText] = useState('');
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Fetch chat data
+  useEffect(() => {
+    if (!chatId || !currentUser) return;
+
+    const fetchChat = async () => {
+      try {
+        const chatDoc = await getDoc(doc(db, 'chats', chatId));
+        
+        if (!chatDoc.exists()) {
+          setError('Chat not found');
+          setLoading(false);
+          return;
+        }
+        
+        const chatData = chatDoc.data();
+        
+        // Check if current user is a member of this chat
+        if (!chatData.members.includes(currentUser.uid)) {
+          setError('You are not a member of this chat');
+          setLoading(false);
+          return;
+        }
+        
+        setChat(chatData);
+        setLoading(false);
+      } catch (err) {
+        console.error('Error fetching chat:', err);
+        setError('Failed to load chat');
+        setLoading(false);
+      }
+    };
+
+    fetchChat();
+  }, [chatId, currentUser]);
+
+  // Subscribe to messages
+  useEffect(() => {
+    if (!chatId || !currentUser) return;
+
+    const messagesQuery = query(
+      collection(db, 'chats', chatId, 'messages'),
+      orderBy('timestamp', 'asc')
+    );
+
+    const unsubscribe = onSnapshot(messagesQuery, (snapshot) => {
+      const messagesList: ChatMessage[] = [];
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        messagesList.push({
+          id: doc.id,
+          text: data.text,
+          senderId: data.senderId,
+          senderName: data.senderName,
+          timestamp: data.timestamp?.toDate(),
+          files: data.files || [],
+          isEdited: data.isEdited || false,
+          isPinned: data.isPinned || false
+        });
+      });
+      setMessages(messagesList);
+    });
+
+    return () => unsubscribe();
+  }, [chatId, currentUser]);
+
+  // Subscribe to typing indicators
+  useEffect(() => {
+    if (!chatId || !currentUser) return;
+
+    const typingQuery = query(
+      collection(db, 'chats', chatId, 'typing'),
+      where('userId', '!=', currentUser.uid)
+    );
+
+    const unsubscribe = onSnapshot(typingQuery, (snapshot) => {
+      const typingList: TypingIndicatorType[] = [];
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        // Only show typing indicators that are recent (within the last 10 seconds)
+        const timestamp = data.timestamp?.toDate();
+        if (timestamp && (new Date().getTime() - timestamp.getTime()) < 10000) {
+          typingList.push({
+            id: doc.id,
+            userId: data.userId,
+            userName: data.userName,
+            timestamp: timestamp
+          });
+        }
+      });
+      setTypingUsers(typingList);
+    });
+
+    return () => unsubscribe();
+  }, [chatId, currentUser]);
+
+  // Scroll to bottom when messages change
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  // Update typing indicator
+  const updateTypingStatus = async (isTyping: boolean) => {
+    if (!chatId || !currentUser) return;
+
+    try {
+      const typingRef = doc(db, 'chats', chatId, 'typing', currentUser.uid);
+      
+      if (isTyping) {
+        await updateDoc(typingRef, {
+          userId: currentUser.uid,
+          userName: currentUser.displayName,
+          timestamp: serverTimestamp()
+        }).catch(() => {
+          // If document doesn't exist, create it
+          addDoc(collection(db, 'chats', chatId, 'typing'), {
+            userId: currentUser.uid,
+            userName: currentUser.displayName,
+            timestamp: serverTimestamp()
+          });
+        });
+      } else {
+        // Remove typing indicator when not typing
+        await deleteDoc(typingRef).catch(() => {
+          // Ignore errors if document doesn't exist
+        });
+      }
+    } catch (err) {
+      console.error('Error updating typing status:', err);
+    }
+  };
+
+  const handleMessageChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setMessageText(e.target.value);
+    
+    // Update typing indicator
+    if (!isTyping && e.target.value.trim()) {
+      setIsTyping(true);
+      updateTypingStatus(true);
+    } else if (isTyping && !e.target.value.trim()) {
+      setIsTyping(false);
+      updateTypingStatus(false);
+    }
+    
+    // Clear previous timeout
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+    }
+    
+    // Set timeout to clear typing indicator after 5 seconds of inactivity
+    typingTimeoutRef.current = setTimeout(() => {
+      if (isTyping) {
+        setIsTyping(false);
+        updateTypingStatus(false);
+      }
+    }, 5000);
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    
+    // Convert FileList to array and add to uploads
+    const newUploads: FileUpload[] = [];
+    
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      
+      // Determine file type
+      let fileType = 'document';
+      if (file.type.startsWith('image/')) fileType = 'image';
+      else if (file.type.startsWith('video/')) fileType = 'video';
+      else if (file.type.startsWith('audio/')) fileType = 'audio';
+      
+      newUploads.push({
+        file,
+        name: file.name,
+        type: fileType as any,
+        size: file.size,
+        progress: 0,
+        url: '',
+        id: ''
+      });
+    }
+    
+    setFileUploads([...fileUploads, ...newUploads]);
+    
+    // Clear the input value to allow selecting the same file again
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  const removeFileUpload = (index: number) => {
+    const newUploads = [...fileUploads];
+    newUploads.splice(index, 1);
+    setFileUploads(newUploads);
+  };
+
+  const handleSendMessage = async () => {
+    if ((!messageText.trim() && fileUploads.length === 0) || !chatId || !currentUser) return;
+    
+    try {
+      // Reset typing status
+      setIsTyping(false);
+      updateTypingStatus(false);
+      
+      // If editing a message
+      if (editingMessageId) {
+        await updateDoc(doc(db, 'chats', chatId, 'messages', editingMessageId), {
+          text: messageText.trim(),
+          isEdited: true
+        });
+        
+        setEditingMessageId(null);
+        setEditingText('');
+        setMessageText('');
+        return;
+      }
+      
+      // Upload files first if any
+      const uploadedFiles = [];
+      
+      if (fileUploads.length > 0) {
+        for (const upload of fileUploads) {
+          try {
+            // Update progress in state
+            const updatedUploads = [...fileUploads];
+            const index = updatedUploads.findIndex(u => u.name === upload.name && u.size === upload.size);
+            
+            if (index !== -1) {
+              updatedUploads[index].progress = 50;
+              setFileUploads(updatedUploads);
+            }
+            
+            // Upload file to Appwrite
+            const result = await uploadFile(upload.file);
+            
+            if (result && result.id) {
+              uploadedFiles.push({
+                id: result.id,
+                name: upload.name,
+                type: upload.type,
+                size: upload.size,
+                url: result.url
+              });
+              
+              // Update progress to 100%
+              if (index !== -1) {
+                updatedUploads[index].progress = 100;
+                updatedUploads[index].id = result.id;
+                updatedUploads[index].url = result.url;
+                setFileUploads(updatedUploads);
+              }
+            }
+          } catch (err) {
+            console.error('Error uploading file:', err);
+          }
+        }
+      }
+      
+      // Add message to Firestore
+      await addDoc(collection(db, 'chats', chatId, 'messages'), {
+        text: messageText.trim(),
+        senderId: currentUser.uid,
+        senderName: currentUser.displayName || 'Unknown User',
+        timestamp: serverTimestamp(),
+        files: uploadedFiles,
+        isEdited: false,
+        isPinned: false
+      });
+      
+      // Update last message in chat
+      await updateDoc(doc(db, 'chats', chatId), {
+        lastMessage: messageText.trim() || (uploadedFiles.length > 0 ? `[${uploadedFiles[0].type}]` : ''),
+        lastMessageTime: serverTimestamp()
+      });
+      
+      // Clear message and uploads
+      setMessageText('');
+      setFileUploads([]);
+    } catch (err) {
+      console.error('Error sending message:', err);
+    }
+  };
+
+  const handleEditMessage = async () => {
+    if (!editingMessageId || !messageText.trim() || !chatId) return;
+    
+    try {
+      await updateDoc(doc(db, 'chats', chatId, 'messages', editingMessageId), {
+        text: messageText.trim(),
+        isEdited: true
+      });
+      
+      setEditingMessageId(null);
+      setEditingText('');
+      setMessageText('');
+    } catch (err) {
+      console.error('Error editing message:', err);
+    }
+  };
+
+  const startEditingMessage = (message: ChatMessage) => {
+    setEditingMessageId(message.id);
+    setEditingText(message.text);
+    setMessageText(message.text);
+  };
+
+  const cancelEditingMessage = () => {
+    setEditingMessageId(null);
+    setEditingText('');
+    setMessageText('');
+  };
+
+  const handleDeleteMessage = async (messageId: string) => {
+    if (!chatId) return;
+    
+    try {
+      await deleteDoc(doc(db, 'chats', chatId, 'messages', messageId));
+    } catch (err) {
+      console.error('Error deleting message:', err);
+    }
+  };
+
+  const handlePinMessage = async (messageId: string, isPinned: boolean) => {
+    if (!chatId) return;
+    
+    try {
+      await updateDoc(doc(db, 'chats', chatId, 'messages', messageId), {
+        isPinned: !isPinned
+      });
+    } catch (err) {
+      console.error('Error pinning message:', err);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Send message on Enter without Shift
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (editingMessageId) {
+        handleEditMessage();
+      } else {
+        handleSendMessage();
+      }
+    }
+  };
+
+  // If no chat is selected, show a welcome message
+  if (!chatId) {
+    return (
+      <div className="flex items-center justify-center h-full bg-gray-800">
+        <div className="text-center p-8 bg-gray-700 rounded-lg shadow-lg max-w-md">
+          <FiMessageCircle className="mx-auto text-indigo-500" size={48} />
+          <h2 className="text-2xl font-bold text-white mt-4">Welcome to Chat</h2>
+          <p className="text-gray-300 mt-2">
+            Select a conversation from the sidebar or start a new chat to begin messaging.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // Get pinned messages
+  const pinnedMessages = messages.filter(message => message.isPinned);
+
+  // Group messages by sender and date
+  const groupedMessages: ChatMessage[][] = [];
+  let currentGroup: ChatMessage[] = [];
+  let lastSenderId = '';
+  let lastDate = '';
+
+  messages.forEach((message, index) => {
+    const messageDate = message.timestamp ? format(message.timestamp, 'yyyy-MM-dd') : '';
+    
+    // Start a new group if sender changes or date changes or more than 5 minutes between messages
+    if (
+      message.senderId !== lastSenderId || 
+      messageDate !== lastDate ||
+      (index > 0 && message.timestamp && messages[index-1].timestamp && 
+       (message.timestamp.getTime() - messages[index-1].timestamp.getTime() > 5 * 60 * 1000))
+    ) {
+      if (currentGroup.length > 0) {
+        groupedMessages.push([...currentGroup]);
+        currentGroup = [];
+      }
+    }
+    
+    currentGroup.push(message);
+    lastSenderId = message.senderId;
+    lastDate = messageDate;
+  });
+
+  // Add the last group
+  if (currentGroup.length > 0) {
+    groupedMessages.push(currentGroup);
+  }
+
+  return (
+    <div className="flex flex-col h-screen bg-gray-800 text-white">
+      {loading ? (
+        <div className="flex items-center justify-center h-full">
+          <div className="text-center">
+            <FiLoader className="animate-spin mx-auto text-indigo-500" size={48} />
+            <p className="mt-4 text-gray-300">Loading chat...</p>
+          </div>
+        </div>
+      ) : error ? (
+        <div className="flex items-center justify-center h-full">
+          <div className="text-center p-8 bg-gray-700 rounded-lg shadow-lg max-w-md">
+            <div className="mx-auto text-red-500 w-16 h-16 flex items-center justify-center">
+              <FiX size={48} />
+            </div>
+            <h3 className="text-xl font-semibold text-white mb-2">Error</h3>
+            <p className="text-gray-300">{error}</p>
+          </div>
+        </div>
+      ) : (
+        <div className="flex flex-col h-full">
+          {/* Chat header */}
+          <div className="bg-gray-800 border-b border-gray-700 p-4 flex items-center justify-between shadow-md">
+            <div className="flex items-center space-x-3">
+              {chat.isGroup ? (
+                <div className="w-10 h-10 rounded-full bg-indigo-600 flex items-center justify-center">
+                  <FiHash size={20} />
+                </div>
+              ) : (
+                <div className="w-10 h-10 rounded-full bg-gray-600 flex items-center justify-center">
+                  <FiUsers size={20} />
+                </div>
+              )}
+              <div>
+                <h2 className="font-semibold text-white">{chat.name || 'Chat'}</h2>
+                <p className="text-xs text-gray-400">
+                  {chat.members?.length || 0} member{chat.members?.length !== 1 ? 's' : ''}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center space-x-2">
+              <button className="p-2 rounded-full hover:bg-gray-700 transition-colors duration-200">
+                <FiPlusCircle size={20} />
+              </button>
+            </div>
+          </div>
+
+          {/* Pinned messages */}
+          {pinnedMessages.length > 0 && (
+            <div className="bg-indigo-900/20 border-b border-indigo-800/30 p-2">
+              <div className="flex items-center space-x-2 text-indigo-200">
+                <FiStar size={16} />
+                <span className="text-sm font-medium">
+                  {pinnedMessages.length} pinned {pinnedMessages.length === 1 ? 'message' : 'messages'}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* File upload previews */}
+          {fileUploads.length > 0 && (
+            <div className="bg-gray-700 p-2 border-b border-gray-600">
+              <div className="flex flex-wrap gap-2">
+                {fileUploads.map((upload, index) => (
+                  <div 
+                    key={`${upload.name}-${index}`}
+                    className="relative bg-gray-800 rounded-md p-2 flex items-center space-x-2 pr-8"
+                  >
+                    <div className="text-xs text-gray-300 truncate max-w-[150px]">
+                      {upload.name}
+                    </div>
+                    <div className="absolute right-1 top-1">
+                      <button 
+                        onClick={() => removeFileUpload(index)}
+                        className="text-gray-400 hover:text-gray-200"
+                      >
+                        <FiX size={14} />
+                      </button>
+                    </div>
+                    {upload.progress > 0 && upload.progress < 100 && (
+                      <div className="absolute bottom-0 left-0 h-1 bg-indigo-500" style={{ width: `${upload.progress}%` }} />
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Messages area */}
+          <div className="flex-1 overflow-y-auto p-4 space-y-6">
+            {groupedMessages.map((group, groupIndex) => (
+              <div key={groupIndex} className="message-group">
+                {/* Message date separator if needed */}
+                {group[0].timestamp && (groupIndex === 0 || 
+                  (groupedMessages[groupIndex-1][0].timestamp && 
+                   format(group[0].timestamp, 'yyyy-MM-dd') !== format(groupedMessages[groupIndex-1][0].timestamp, 'yyyy-MM-dd'))) && (
+                  <div className="flex items-center justify-center my-4">
+                    <div className="bg-gray-700 text-gray-300 text-xs px-2 py-1 rounded-full">
+                      {format(group[0].timestamp, 'MMMM d, yyyy')}
+                    </div>
+                  </div>
+                )}
+                
+                {/* Message group */}
+                <div className="flex items-start space-x-3">
+                  {/* Avatar */}
+                  <div className="flex-shrink-0">
+                    <div className="w-10 h-10 rounded-full bg-gray-600 flex items-center justify-center text-white">
+                      {group[0].senderName?.charAt(0).toUpperCase() || '?'}
+                    </div>
+                  </div>
+                  
+                  {/* Message content */}
+                  <div className="flex-1 space-y-1">
+                    {/* Sender info and timestamp */}
+                    <div className="flex items-baseline">
+                      <span className="font-medium text-white">{group[0].senderName}</span>
+                      <span className="ml-2 text-xs text-gray-400">
+                        {group[0].timestamp ? format(group[0].timestamp, 'h:mm a') : ''}
+                      </span>
+                    </div>
+                    
+                    {/* Messages */}
+                    <div className="space-y-1">
+                      {group.map((message) => (
+                        <div key={message.id} className="group relative">
+                          {/* Message text */}
+                          <div className="text-gray-200 break-words">
+                            {message.text}
+                            {message.isEdited && (
+                              <span className="text-xs text-gray-400 ml-1">(edited)</span>
+                            )}
+                          </div>
+                          
+                          {/* Files */}
+                          {message.files && message.files.length > 0 && (
+                            <div className="mt-2 space-y-2">
+                              {message.files.map((file, fileIndex) => (
+                                <div key={fileIndex} className="inline-block">
+                                  {file.type === 'image' ? (
+                                    <a href={file.url} target="_blank" rel="noopener noreferrer">
+                                      <img 
+                                        src={file.url} 
+                                        alt={file.name} 
+                                        className="max-w-xs max-h-60 rounded-md"
+                                      />
+                                    </a>
+                                  ) : file.type === 'video' ? (
+                                    <video 
+                                      src={file.url} 
+                                      className="max-w-xs max-h-60 rounded-md" 
+                                      controls
+                                    />
+                                  ) : file.type === 'audio' ? (
+                                    <audio 
+                                      src={file.url} 
+                                      className="max-w-xs" 
+                                      controls
+                                    />
+                                  ) : (
+                                    <a 
+                                      href={file.url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="flex items-center space-x-2 bg-gray-700 p-2 rounded-md hover:bg-gray-600 transition-colors"
+                                    >
+                                      <FiPaperclip size={16} />
+                                      <span className="text-sm truncate max-w-[200px]">{file.name}</span>
+                                    </a>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          
+                          {/* Message actions */}
+                          <div className="absolute right-0 top-0 hidden group-hover:flex items-center space-x-1 bg-gray-700 rounded-md shadow-md">
+                            {message.senderId === currentUser?.uid && (
+                              <>
+                                <button 
+                                  onClick={() => startEditingMessage(message)}
+                                  className="p-1 text-gray-400 hover:text-white"
+                                >
+                                  <FiEdit size={14} />
+                                </button>
+                                <button 
+                                  onClick={() => handleDeleteMessage(message.id)}
+                                  className="p-1 text-gray-400 hover:text-red-500"
+                                >
+                                  <FiTrash2 size={14} />
+                                </button>
+                              </>
+                            )}
+                            <button 
+                              onClick={() => handlePinMessage(message.id, message.isPinned)}
+                              className={`p-1 ${message.isPinned ? 'text-yellow-500' : 'text-gray-400 hover:text-yellow-500'}`}
+                            >
+                              <FiStar size={14} />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+            
+            {/* Typing indicators */}
+            {typingUsers.length > 0 && (
+              <div className="flex items-center space-x-2 text-gray-400 text-sm">
+                <div className="flex space-x-1">
+                  <span className="animate-bounce">•</span>
+                  <span className="animate-bounce delay-75">•</span>
+                  <span className="animate-bounce delay-150">•</span>
+                </div>
+                <span>
+                  {typingUsers.length === 1 
+                    ? `${typingUsers[0].userName} is typing...` 
+                    : `${typingUsers.length} people are typing...`}
+                </span>
+              </div>
+            )}
+            
+            {/* Scroll anchor */}
+            <div ref={messagesEndRef} />
+          </div>
+
+          {/* Message input */}
+          <div className="p-4 border-t border-gray-700 bg-gray-800">
+            {editingMessageId ? (
+              <div className="flex flex-col space-y-2">
+                <div className="flex items-center justify-between text-xs text-gray-400 px-2">
+                  <span>Editing message</span>
+                  <button 
+                    className="text-gray-400 hover:text-white"
+                    onClick={cancelEditingMessage}
+                  >
+                    Cancel
+                  </button>
+                </div>
+                <div className="flex items-end space-x-2">
+                  <textarea
+                    className="flex-1 resize-none border border-gray-600 bg-gray-700 text-gray-100 rounded-lg p-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                    placeholder="Edit your message..."
+                    rows={1}
+                    value={messageText}
+                    onChange={handleMessageChange}
+                    onKeyDown={handleKeyDown}
+                  />
+                  <button
+                    type="button"
+                    className="inline-flex items-center justify-center p-2 rounded-full bg-indigo-600 text-white hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+                    onClick={handleEditMessage}
+                  >
+                    <FiCheck size={20} />
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-end space-x-2">
+                <button
+                  type="button"
+                  className="inline-flex items-center justify-center p-2 rounded-full text-gray-400 hover:bg-gray-700 hover:text-gray-300 focus:outline-none transition-colors"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <FiPaperclip size={20} />
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    className="hidden"
+                    multiple
+                    onChange={handleFileChange}
+                  />
+                </button>
+                <textarea
+                  className="flex-1 resize-none border border-gray-600 bg-gray-700 text-gray-100 rounded-lg p-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                  placeholder="Type a message..."
+                  rows={1}
+                  value={messageText}
+                  onChange={handleMessageChange}
+                  onKeyDown={handleKeyDown}
+                />
+                <button
+                  type="button"
+                  className="inline-flex items-center justify-center p-2 rounded-full bg-indigo-600 text-white hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors"
+                  onClick={handleSendMessage}
+                >
+                  <FiSend size={20} />
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default Chat;
